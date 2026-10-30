@@ -1,5 +1,5 @@
 name: astrbot_plugin_hongdou_stock
-display_name: 红豆股市
+display_name: 群友笑传之CCB · 红豆股市
 short_desc: 用红豆币在群里炒股，有低保兜底，永远玩不破产。
 desc: |
   一个完全离线的模拟炒股插件。钱币叫**红豆币**。
@@ -43,7 +43,7 @@ desc: |
   所有股票、板块、公司名均为虚构，与任何真实标的无关。
 version: 1.0.0
 author: hongdougao111
-repo: https://github.com/hongdougao111/群友笑传之CCB
+repo: https://github.com/hongdougao111/qunyou-xiaozhuan-CCB
 astrbot_version: ">=4.0.0"
 support_platforms:
   - aiocqhttp
