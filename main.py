@@ -1,29 +1,37 @@
-"""红豆股市 · 模拟炒股插件 for AstrBot。
+"""FX战士久留美 · 外汇保证金交易模拟插件 for AstrBot。
 
-钱币叫「红豆币」。
+钱币还是「红豆币」，玩法换成了外汇保证金交易。
 
-设计取向（为什么这么写）：
-  - **指令少**：只有 /股 一个指令，后面跟子命令。避免指令表刷屏。
-  - **低保兜底**：身无分文也能每天领一笔，永远不至于「玩不下去了」。
-  - **状态全落盘**：所有玩家数据存 data/plugin_data/ 下，重启不丢。
-  - **纯本地模拟**：不联网、不请求任何真实行情，价格由随机游走生成。
+═══ 这个插件想表达什么 ═══
 
-指令：
-    /股                     行情总览
-    /股 买 <代码> <股数>      买入
-    /股 卖 <代码> <股数>      卖出
-    /股 仓                   我的持仓
-    /股 榜                   富豪榜
-    /股 低保                 领低保
-    /股 看 <代码>            单只详情
+「FX战士久留美」这个名字来自那个著名的梗：一个把外汇当赌场、
+杠杆开到最大、然后一路爆仓的战士。
 
-没有任何 AstrBot 时也能跑 test_plugin.py 验证逻辑。
+所以这个插件的核心不是「怎么赚钱」，而是**仓位管理**：
+
+  - 默认 1 手 = 1000 红豆币名义价值
+  - 杠杆可以开到 500 倍（1000 倍是真实世界的自杀选项，这里不给）
+  - 100 倍杠杆下，价格反向走 1% 就爆仓
+  - 每 tick 检查权益，跌破保证金 50% 直接强平，余额清零
+
+**低保兜底**：爆仓了也能每天领一笔，永远玩得下去。
+这不是慈善，是让游戏不会因为一个人破产而结束。
+
+指令（只有一个 /fx）：
+    /fx                      行情
+    /fx 多 <货币对> <手数> [杠杆]    做多
+    /fx 空 <货币对> <手数> [杠杆]    做空
+    /fx 平 <编号>             平仓
+    /fx 全平                  一键平掉全部
+    /fx 仓                    我的仓位
+    /fx 榜                    富豪榜
+    /fx 低保                  领低保
+    /fx 看 <货币对>            单对详情
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import random
 import time
 from pathlib import Path
 from typing import Any
@@ -33,19 +41,16 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from . import market
-from .stocks import STOCKS, resolve
+from .pairs import PAIRS, fmt_price, resolve
 
-# ---------------------------------------------------------------------------
-# 配置默认值（与 _conf_schema.json 保持一致）
-# ---------------------------------------------------------------------------
 DEFAULTS: dict[str, Any] = {
     "tick_minutes": 5,
     "initial_cash": 1000,
-    "low_income_amount": 200,
+    "low_income_amount": 300,
     "low_income_threshold": 300,
-    "dividend_hours": 6,
-    "dividend_rate": 0.8,
-    "price_decimals": 2,
+    "default_leverage": 100,
+    "max_leverage": 500,
+    "swap_rate_daily": 0.02,
 }
 
 MIN_TICK_MINUTES = 1
@@ -55,10 +60,10 @@ MAX_TICK_MINUTES = 120
 @register(
     "astrbot_plugin_hongdou_stock",
     "hongdougao111",
-    "红豆股市：用红豆币模拟炒股，带低保兜底",
-    "1.0.0",
+    "FX战士久留美：红豆币外汇保证金交易，会爆仓，也有低保",
+    "2.0.0",
 )
-class HongdouStockPlugin(Star):
+class FxKurumiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config
@@ -72,25 +77,23 @@ class HongdouStockPlugin(Star):
     # ---------------- 生命周期 ----------------
 
     async def initialize(self) -> None:
-        """启动：建目录、读档、补算漏掉的 tick、起行情循环。"""
         try:
             data_dir = StarTools.get_data_dir("astrbot_plugin_hongdou_stock")
         except Exception as e:
-            # 拿不到官方数据目录时退到插件自身目录，宁可脏一点也别丢档
-            logger.warning(f"[hongdou-stock] 取数据目录失败，改用插件目录: {e}")
+            logger.warning(f"[fx-kurumi] 取数据目录失败，改用插件目录: {e}")
             data_dir = Path(__file__).parent / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
-        self._state_path = data_dir / "market.json"
+        self._state_path = data_dir / "fx.json"
+
         self._state = self._load()
         tick_sec = self._tick_seconds()
 
-        # 停机期间漏掉的行情补算一小段，避免价格停在很久以前
         try:
             n = market.catch_up(self._state, tick_sec, max_ticks=240)
             if n:
-                logger.info(f"[hongdou-stock] 补算了 {n} 个行情周期")
+                logger.info(f"[fx-kurumi] 补算了 {n} 个行情周期")
         except Exception as e:
-            logger.error(f"[hongdou-stock] 补算行情失败: {e}")
+            logger.error(f"[fx-kurumi] 补算行情失败: {e}")
 
         self._save(force=True)
         self._diag = {
@@ -99,14 +102,13 @@ class HongdouStockPlugin(Star):
             "tick_count": self._state.get("tick_count", 0),
         }
         logger.info(
-            f"[hongdou-stock] 已加载：{self._diag['users']} 个账户 / "
-            f"{self._diag['tick_count']} 个周期 / 存档 {self._state_path}"
+            f"[fx-kurumi] 已加载：{self._diag['users']} 个账户 / "
+            f"{self._diag['tick_count']} 个周期"
         )
 
         self._task = asyncio.create_task(self._market_loop())
 
     async def terminate(self) -> None:
-        """卸载：停循环、落盘。"""
         if self._task:
             self._task.cancel()
             try:
@@ -125,30 +127,26 @@ class HongdouStockPlugin(Star):
         try:
             raw = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
-            logger.error(f"[hongdou-stock] 存档损坏，重新开市: {e}")
+            logger.error(f"[fx-kurumi] 存档损坏，重新开市: {e}")
             return market.new_state()
-        if not isinstance(raw, dict) or "stocks" not in raw:
-            logger.error("[hongdou-stock] 存档结构不对，重新开市")
+
+        # 旧版（股票版）存档没有 quotes 字段，直接重开，不尝试迁移
+        if not isinstance(raw, dict) or "quotes" not in raw:
+            logger.warning("[fx-kurumi] 检测到旧版存档（股票版），已重置为外汇市场")
             return market.new_state()
-        # 补齐后来新增的股票，老存档不至于缺票
-        stocks = raw.setdefault("stocks", {})
-        for s in STOCKS:
-            stocks.setdefault(
-                s.code,
-                {
-                    "price": s.base_price,
-                    "open": s.base_price,
-                    "prev_close": s.base_price,
-                    "history": [s.base_price],
-                    "volume": 0,
-                },
+
+        quotes = raw.setdefault("quotes", {})
+        for p in PAIRS:
+            quotes.setdefault(
+                p.code,
+                {"price": p.base, "open": p.base, "prev_close": p.base,
+                 "history": [p.base]},
             )
         raw.setdefault("users", {})
         raw.setdefault("news", [])
         return raw
 
     def _save(self, force: bool = False) -> None:
-        """写盘。非强制时最多 10 秒一次，避免频繁 IO。"""
         if self._state is None or self._state_path is None:
             return
         now = time.time()
@@ -161,9 +159,9 @@ class HongdouStockPlugin(Star):
                 json.dumps(self._state, ensure_ascii=False, indent=1),
                 encoding="utf-8",
             )
-            tmp.replace(self._state_path)   # 原子替换，断电不留半个文件
+            tmp.replace(self._state_path)
         except OSError as e:
-            logger.error(f"[hongdou-stock] 存档写入失败: {e}")
+            logger.error(f"[fx-kurumi] 存档写入失败: {e}")
 
     # ---------------- 配置 ----------------
 
@@ -196,17 +194,19 @@ class HongdouStockPlugin(Star):
     def _low_income_threshold(self) -> float:
         return self._cfg_num("low_income_threshold", 0, 100_000_000)
 
-    def _dividend_seconds(self) -> int:
-        return int(self._cfg_num("dividend_hours", 1, 720) * 3600)
+    def _default_leverage(self) -> int:
+        return int(self._cfg_num("default_leverage", 1, 500))
 
-    def _dividend_rate(self) -> float:
-        """每次分红的比例（占持仓市值），配置里是百分数。"""
-        return self._cfg_num("dividend_rate", 0, 20) / 100.0
+    def _max_leverage(self) -> int:
+        return int(self._cfg_num("max_leverage", 1, 500))
+
+    def _swap_rate(self) -> float:
+        """每日隔夜利息率（配置里是百分数）。"""
+        return self._cfg_num("swap_rate_daily", 0, 1) / 100.0
 
     # ---------------- 行情循环 ----------------
 
     async def _market_loop(self) -> None:
-        """后台循环：按周期推进行情、分红、存档。"""
         while True:
             try:
                 await asyncio.sleep(self._tick_seconds())
@@ -214,69 +214,79 @@ class HongdouStockPlugin(Star):
                     if self._state is None:
                         continue
                     news = market.tick_state(self._state, self._tick_seconds())
-                    self._maybe_dividend()
+                    self._settle_swap()
+                    liquidated = self._liquidate_all()
                     self._save()
+                for line in liquidated:
+                    logger.warning("[fx-kurumi] " + line)
                 if news:
-                    logger.info("[hongdou-stock] " + "；".join(news))
+                    logger.info("[fx-kurumi] " + "；".join(news))
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # 单次失败不能让循环死掉，否则行情永远停住
-                logger.error(f"[hongdou-stock] 行情循环异常: {e}")
+                logger.error(f"[fx-kurumi] 行情循环异常: {e}")
                 await asyncio.sleep(30)
 
-    def _maybe_dividend(self) -> None:
-        """到点了就给所有持仓用户发分红。"""
+    def _settle_swap(self) -> None:
+        """每天结算一次隔夜利息。"""
         if self._state is None:
             return
         now = time.time()
-        period = self._dividend_seconds()
-        last = float(self._state.get("last_dividend_at") or 0.0)
-        if now - last < period:
+        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        if self._state.get("last_swap_day") == today:
             return
-        self._state["last_dividend_at"] = now
-        paid = market.pay_dividends(self._state, self._dividend_rate())
+        self._state["last_swap_day"] = today
+        paid = market.pay_swap(self._state, self._swap_rate(), now=now)
         if paid:
-            total = sum(a for _, a in paid)
-            logger.info(
-                f"[hongdou-stock] 分红：{len(paid)} 个账户，共 {total:.0f} 红豆币"
-            )
+            logger.info(f"[fx-kurumi] 隔夜利息结算 {len(paid)} 个账户")
+
+    def _liquidate_all(self) -> list[str]:
+        """检查所有用户爆仓。"""
+        if self._state is None:
+            return []
+        out: list[str] = []
+        for uid, u in (self._state.get("users") or {}).items():
+            msgs = market.check_liquidation(self._state, u)
+            for m in msgs:
+                out.append(f"{u.get('name', uid)} {m}")
+        return out
 
     # ---------------- 指令 ----------------
 
-    @filter.command("股")
-    async def stock(self, event: AstrMessageEvent, sub: str = "", arg1: str = "",
-                    arg2: str = ""):
-        """红豆股市。用法：/股 买|卖|仓|榜|低保|看"""
+    @filter.command("fx")
+    async def fx(self, event: AstrMessageEvent, sub: str = "", arg1: str = "",
+                 arg2: str = "", arg3: str = ""):
+        """FX战士久留美。用法：/fx 多|空|平|全平|仓|榜|低保|看"""
         async with self._lock:
             if self._state is None:
                 self._state = market.new_state()
 
             uid = event.get_sender_id() or "unknown"
             name = event.get_sender_name() or uid
-            u = market.user_of(
-                self._state, uid, name, self._initial_cash()
-            )
+            u = market.user_of(self._state, uid, name, self._initial_cash())
 
-            sub = (sub or "").strip().lower()
-            text = await self._dispatch(event, u, sub, arg1, arg2)
+            text = await self._dispatch(event, u, sub.strip().lower(),
+                                        arg1, arg2, arg3)
             self._save()
         yield event.plain_result(text)
 
     async def _dispatch(self, event: AstrMessageEvent, u: dict[str, Any],
-                        sub: str, a1: str, a2: str) -> str:
-        """子命令分发。返回要发的文本。"""
+                        sub: str, a1: str, a2: str, a3: str) -> str:
         assert self._state is not None
         st = self._state
 
         if sub in ("", "行情", "市", "q"):
             return self._render_market(st, u)
-        if sub in ("买", "b", "buy"):
-            return self._do_buy(st, u, a1, a2)
-        if sub in ("卖", "s", "sell"):
-            return self._do_sell(st, u, a1, a2)
-        if sub in ("仓", "持仓", "c", "me"):
-            return self._render_holdings(st, u)
+        if sub in ("多", "long", "l"):
+            return self._do_open(st, u, a1, a2, a3, "long")
+        if sub in ("空", "short", "s"):
+            return self._do_open(st, u, a1, a2, a3, "short")
+        if sub in ("平", "close", "c"):
+            return self._do_close(st, u, a1)
+        if sub in ("全平", "平全", "closeall", "ca"):
+            return self._do_close_all(st, u)
+        if sub in ("仓", "仓位", "pos"):
+            return self._render_positions(st, u)
         if sub in ("榜", "排行", "rank"):
             return self._render_rank(st, u, event.get_sender_id() or "")
         if sub in ("低保", "welfare"):
@@ -285,126 +295,166 @@ class HongdouStockPlugin(Star):
             return self._render_detail(st, a1)
         return (
             "不认识这个子命令。\n"
-            "/股 行情   /股 买 代码 股数   /股 卖 代码 股数\n"
-            "/股 仓     /股 榜     /股 低保    /股 看 代码"
+            "/fx 行情　/fx 多 USDJPY 0.5 100　/fx 空 XAUUSD 0.1\n"
+            "/fx 平 1　/fx 全平　/fx 仓　/fx 榜　/fx 低保　/fx 看 USDJPY"
         )
 
-    # ---------------- 各页面渲染 ----------------
+    # ---------------- 渲染 ----------------
 
     def _render_market(self, st: dict[str, Any], u: dict[str, Any]) -> str:
-        lines = ["🍁 红豆股市 · 实时行情", ""]
-        for s in STOCKS:
-            px = market.price_of(st, s.code)
-            chg = market.change_pct(st, s.code)
-            arrow = "▲" if chg > 0.0005 else ("▼" if chg < -0.0005 else "—")
-            spark = market.sparkline(st, s.code, 10)
+        lines = ["🍁 FX战士久留美 · 实时报价", ""]
+        for p in PAIRS:
+            px = market.price_of(st, p.code)
+            chg = market.change_pct(st, p.code)
+            arrow = "▲" if chg > 0.00005 else ("▼" if chg < -0.00005 else "—")
+            spark = market.sparkline(st, p.code, 10)
             lines.append(
-                f"{s.name} {s.code}  {px:>8.2f}  {arrow}{chg * 100:+.2f}%  {spark}"
+                f"{p.name:<9}{fmt_price(p, px):>11}  {arrow}{chg * 100:+.2f}%  {spark}"
             )
-        cash = float(u.get("cash", 0.0))
-        total = market.total_assets(st, u)
+        eq = market.equity(st, u)
+        used = market.used_margin(st, u)
+        lvl = market.margin_level(st, u)
         lines.append("")
-        lines.append(f"你的红豆币：{cash:.0f}   总资产：{total:.0f}")
-        lines.append("买：/股 买 HD003 10　详情：/股 看 HD003")
+        lines.append(f"权益 {eq:.2f}　占用保证金 {used:.2f}")
+        if lvl is not None:
+            warn = " ⚠️危险" if lvl < 200 else ""
+            lines.append(f"保证金比例 {lvl:.0f}%{warn}")
+        lines.append("开仓：/fx 多 USDJPY 0.5 100　（手数 杠杆）")
         return "\n".join(lines)
 
     def _render_detail(self, st: dict[str, Any], code: str) -> str:
-        s = resolve(code)
-        if s is None:
-            return "没有这只股票，用 /股 看行情表。"
-        px = market.price_of(st, s.code)
-        chg = market.change_pct(st, s.code)
-        hist = list((st.get("stocks", {}).get(s.code) or {}).get("history") or [])
+        p = resolve(code)
+        if p is None:
+            return "没有这个货币对，用 /fx 看行情表。"
+        px = market.price_of(st, p.code)
+        chg = market.change_pct(st, p.code)
+        hist = list((st.get("quotes", {}).get(p.code) or {}).get("history") or [])
         hi = max(hist) if hist else px
         lo = min(hist) if hist else px
+        bid, ask = market.bid_ask(st, p.code)
         return (
-            f"【{s.name}】{s.code} · {s.sector}\n"
-            f"现价 {px:.2f}　今日 {chg * 100:+.2f}%\n"
-            f"近期区间 {lo:.2f} ~ {hi:.2f}\n"
-            f"走势 {market.sparkline(st, s.code, 24)}\n"
-            f"{s.desc}"
+            f"【{p.name}】{p.code}\n"
+            f"中间价 {fmt_price(p, px)}　今日 {chg * 100:+.2f}%\n"
+            f"买价 {fmt_price(p, bid)}　卖价 {fmt_price(p, ask)}\n"
+            f"近期区间 {fmt_price(p, lo)} ~ {fmt_price(p, hi)}\n"
+            f"走势 {market.sparkline(st, p.code, 24)}\n"
+            f"{p.desc}"
         )
 
-    def _render_holdings(self, st: dict[str, Any], u: dict[str, Any]) -> str:
-        hold = u.get("holdings") or {}
-        cash = float(u.get("cash", 0.0))
-        if not hold:
-            return (
-                f"你还没有持仓。\n红豆币：{cash:.0f}\n"
-                f"看看行情：/股"
-            )
-        lines = ["🍁 我的持仓", ""]
-        total_pnl = 0.0
-        for code, sh in hold.items():
-            s = resolve(code)
-            px = market.price_of(st, code)
-            mv = px * sh
-            cost = float((u.get("cost") or {}).get(code, 0.0))
-            pnl = mv - cost
-            total_pnl += pnl
-            pct = (pnl / cost * 100) if cost > 0 else 0.0
-            nm = s.name if s else code
+    def _render_positions(self, st: dict[str, Any], u: dict[str, Any]) -> str:
+        pos_list = u.get("positions") or []
+        bal = float(u.get("balance", 0.0))
+        if not pos_list:
+            return f"你还没有仓位。\n余额 {bal:.2f}　权益 {market.equity(st, u):.2f}"
+
+        lines = ["🍁 我的仓位", ""]
+        for i, pos in enumerate(pos_list, 1):
+            p = resolve(pos.get("pair", ""))
+            side = "多" if pos.get("side") == "long" else "空"
+            pnl = market.position_pnl(st, pos)
+            px = market.price_of(st, pos.get("pair", ""))
+            digits = p.digits if p else 3
+            mark = "🟢" if pnl >= 0 else "🔴"
             lines.append(
-                f"{nm} {code}  {sh} 股 @ {px:.2f}  市值 {mv:.0f}  "
-                f"{'浮盈' if pnl >= 0 else '浮亏'} {pnl:+.0f} ({pct:+.1f}%)"
+                f"[{i}] {pos.get('pair')} {side} {pos.get('lots', 0):g}手 "
+                f"{pos.get('leverage')}x {mark}{pnl:+.2f}"
             )
+            lines.append(
+                f"    开 {pos.get('entry', 0):.{digits}f} → 现 {px:.{digits}f}　"
+                f"保证金 {pos.get('margin', 0):.2f}"
+            )
+
+        eq = market.equity(st, u)
+        used = market.used_margin(st, u)
+        lvl = market.margin_level(st, u)
         lines.append("")
-        lines.append(
-            f"现金 {cash:.0f}　持仓 {market.holding_value(st, u):.0f}　"
-            f"总资产 {market.total_assets(st, u):.0f}"
-        )
-        lines.append(f"浮动盈亏合计 {total_pnl:+.0f}")
+        lines.append(f"余额 {bal:.2f}　浮动 {market.floating_pnl(st, u):+.2f}")
+        lines.append(f"权益 {eq:.2f}　占用 {used:.2f}　可用 {market.free_margin(st, u):.2f}")
+        if lvl is not None:
+            warn = "　⚠️ 保证金不足，随时可能爆仓" if lvl < 150 else ""
+            lines.append(f"保证金比例 {lvl:.0f}%{warn}")
         return "\n".join(lines)
 
     def _render_rank(self, st: dict[str, Any], u: dict[str, Any],
                      my_uid: str) -> str:
         rows = market.ranking(st, 10)
         if not rows:
-            return "还没有人入市，你可以做第一个。"
-        lines = ["🍁 红豆富豪榜", ""]
+            return "还没有人入市。"
+        lines = ["🍁 久留美富豪榜", ""]
         for i, (uid, nm, assets) in enumerate(rows, 1):
             medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
             me = " ←你" if uid == my_uid else ""
-            lines.append(f"{medal} {nm}  {assets:.0f}{me}")
+            lines.append(f"{medal} {nm}  {assets:.2f}{me}")
         return "\n".join(lines)
 
-    # ---------------- 交易 ----------------
+    # ---------------- 开平仓 ----------------
 
-    def _do_buy(self, st: dict[str, Any], u: dict[str, Any],
-                code: str, shares_s: str) -> str:
-        if not code or not shares_s:
-            return "用法：/股 买 代码 股数　例：/股 买 HD003 10"
-        s = resolve(code)
-        if s is None:
-            return f"没有 {code} 这只股票。"
+    def _do_open(self, st: dict[str, Any], u: dict[str, Any],
+                 code: str, lots_s: str, lev_s: str, side: str) -> str:
+        word = "多" if side == "long" else "空"
+        if not code or not lots_s:
+            return (
+                f"用法：/fx {word} 货币对 手数 [杠杆]\n"
+                f"例：/fx {word} USDJPY 0.5 100"
+            )
+        p = resolve(code)
+        if p is None:
+            return f"没有 {code} 这个货币对。"
+
         try:
-            shares = int(float(shares_s))
+            lots = float(lots_s)
         except (TypeError, ValueError):
-            return "股数要写数字，比如 10。"
-        ok, msg = market.buy(st, u, s.code, shares)
-        if not ok:
-            return msg
-        return msg + f"\n现金余额 {float(u.get('cash', 0.0)):.0f}"
+            return "手数要写数字，比如 0.5。"
 
-    def _do_sell(self, st: dict[str, Any], u: dict[str, Any],
-                 code: str, shares_s: str) -> str:
-        if not code or not shares_s:
-            return "用法：/股 卖 代码 股数　例：/股 卖 HD003 10"
-        s = resolve(code)
-        if s is None:
-            return f"没有 {code} 这只股票。"
-        owned = int((u.get("holdings") or {}).get(s.code, 0))
-        if shares_s.strip().lower() in ("all", "全", "全部"):
-            shares = owned
-        else:
+        # 杠杆：没填就用默认值
+        if lev_s.strip():
             try:
-                shares = int(float(shares_s))
+                lev = int(float(lev_s))
             except (TypeError, ValueError):
-                return "股数要写数字，或写 all 全卖。"
-        ok, msg = market.sell(st, u, s.code, shares)
+                return "杠杆要写整数，比如 100。"
+        else:
+            lev = self._default_leverage()
+
+        cap = self._max_leverage()
+        if lev > cap:
+            return f"杠杆最高 {cap} 倍。想再高？那是在赌命。"
+        if lev < 1:
+            return "杠杆至少 1 倍。"
+
+        ok, msg = market.open_position(st, u, p.code, side, lots, lev)
         if not ok:
             return msg
-        return msg + f"\n现金余额 {float(u.get('cash', 0.0)):.0f}"
+        # 开仓后立刻检查一次爆仓（极端情况）
+        liq = market.check_liquidation(st, u)
+        if liq:
+            return msg + "\n" + "\n".join(liq)
+        return msg
+
+    def _do_close(self, st: dict[str, Any], u: dict[str, Any], idx_s: str) -> str:
+        if not idx_s:
+            return "用法：/fx 平 编号　（编号看 /fx 仓）"
+        try:
+            idx = int(idx_s)
+        except (TypeError, ValueError):
+            return "编号要写数字，比如 1。"
+        ok, msg = market.close_position(st, u, idx - 1)
+        if not ok:
+            return msg
+        return msg + f"\n余额 {float(u.get('balance', 0.0)):.2f}"
+
+    def _do_close_all(self, st: dict[str, Any], u: dict[str, Any]) -> str:
+        pos_list = u.get("positions") or []
+        if not pos_list:
+            return "你没有仓位。"
+        n = len(pos_list)
+        lines = []
+        # 倒序平，避免索引错位
+        for i in range(n - 1, -1, -1):
+            ok, msg = market.close_position(st, u, i, reason="一键平仓")
+            if ok:
+                lines.append(msg)
+        return f"平掉 {len(lines)} 个仓位\n" + "\n".join(lines) + \
+               f"\n余额 {float(u.get('balance', 0.0)):.2f}"
 
     # ---------------- 低保 ----------------
 
@@ -415,29 +465,28 @@ class HongdouStockPlugin(Star):
             return why
         amount = self._low_income_amount()
         if amount <= 0:
-            return "管理员把低保关掉了（金额为 0），自求多福吧。"
+            return "管理员把低保关掉了，自求多福吧。"
         msg = market.grant_low_income(st, u, amount)
-        return f"🍚 {msg}\n现金余额 {float(u.get('cash', 0.0)):.0f}"
+        return f"🍚 {msg}\n余额 {float(u.get('balance', 0.0)):.2f}"
 
     # ---------------- 诊断 ----------------
 
-    @filter.command("股诊断")
+    @filter.command("fx诊断")
     async def diagnose(self, event: AstrMessageEvent):
-        """检查红豆股市运行状态。"""
-        assert self._state is not None or True
+        """检查 FX战士久留美 运行状态。"""
         st = self._state or {}
         users = len(st.get("users") or {})
         ticks = int(st.get("tick_count", 0))
         last = float(st.get("last_tick", 0.0))
         ago = int(time.time() - last) if last else -1
         yield event.plain_result(
-            "【红豆股市 诊断】\n"
+            "【FX战士久留美 诊断】\n"
             f"存档：{self._diag.get('state_path', '(未初始化)')}\n"
             f"账户 {users} 个　行情周期 {ticks} 次\n"
             f"上次行情：{ago} 秒前　间隔 {self._tick_seconds()} 秒\n"
-            f"低保 {self._low_income_amount():.0f}（资产低于 "
+            f"默认杠杆 {self._default_leverage()}x　上限 {self._max_leverage()}x\n"
+            f"强平线：权益 < 保证金 × {market.MARGIN_CALL_RATIO * 100:.0f}%\n"
+            f"低保 {self._low_income_amount():.0f}（权益低于 "
             f"{self._low_income_threshold():.0f} 可领，每天一次）\n"
-            f"分红每 {self._cfg_num('dividend_hours', 1, 720):.0f} 小时，"
-            f"持仓市值的 {self._cfg_num('dividend_rate', 0, 20):.2f}%\n"
             f"行情循环：{'运行中' if self._task and not self._task.done() else '已停止'}"
         )
