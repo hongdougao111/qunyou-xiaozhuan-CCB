@@ -1,4 +1,4 @@
-"""红豆股市 · 离线自测。
+"""FX战士久留美 · 离线自测。
 
 用伪造的 astrbot 模块跑一遍，不需要安装 AstrBot。
 
@@ -9,8 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import shutil
 import sys
-import tempfile
 import types
 from pathlib import Path
 
@@ -32,9 +32,6 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name} {detail}")
 
 
-# ---------------------------------------------------------------------------
-# 伪造 astrbot
-# ---------------------------------------------------------------------------
 def install_fake_astrbot(data_dir: Path):
     class Plain:
         def __init__(self, text=""):
@@ -97,7 +94,7 @@ def install_fake_astrbot(data_dir: Path):
 
 
 class FakeEvent:
-    def __init__(self, uid="1001", name="测试用户"):
+    def __init__(self, uid="1001", name="久留美"):
         self._uid = uid
         self._name = name
 
@@ -112,41 +109,46 @@ class FakeEvent:
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    try:
+        return asyncio.get_event_loop().run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
 
 
 def call(p, event, *args):
-    """调 /股 指令，返回文本。"""
     async def go():
-        async for r in p.stock(event, *args):
+        async for r in p.fx(event, *args):
             return r.text
         return ""
     return run(go())
 
 
+def set_price(st, code, price):
+    """测试辅助：直接改价格，模拟行情走到某处。"""
+    st["quotes"][code]["price"] = price
+
+
 # ---------------------------------------------------------------------------
 def main():
-    # 用工作区内的临时目录，避免系统 temp 在某些沙箱下不可列
-    import shutil
     tmp = HERE / "_testdata"
     if tmp.exists():
         shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True, exist_ok=True)
     Plain, FakeConfig = install_fake_astrbot(tmp)
-    sys.path.insert(0, str(HERE.parent))   # 为了 `from astrbot_plugin_hongdou_stock import`
+    sys.path.insert(0, str(HERE.parent))
 
-    # 包导入：插件目录本身就是包
     import importlib
-    pkg = importlib.import_module("astrbot_plugin_hongdou_stock.market")
-    stk = importlib.import_module("astrbot_plugin_hongdou_stock.stocks")
+    mkt = importlib.import_module("astrbot_plugin_hongdou_stock.market")
+    prs = importlib.import_module("astrbot_plugin_hongdou_stock.pairs")
     plugin_main = importlib.import_module("astrbot_plugin_hongdou_stock.main")
-    P = plugin_main.HongdouStockPlugin
+    P = plugin_main.FxKurumiPlugin
 
     # ------------------------------------------------------------------
     print("[1] 配置 Schema")
     schema = json.loads((HERE / "_conf_schema.json").read_text(encoding="utf-8"))
-    for key in ("tick_minutes", "initial_cash", "low_income_amount",
-                "low_income_threshold", "dividend_hours", "dividend_rate"):
+    for key in ("tick_minutes", "initial_cash", "default_leverage",
+                "max_leverage", "low_income_amount", "low_income_threshold",
+                "swap_rate_daily"):
         check(f"Schema 含 {key}", key in schema, str(list(schema)))
     missing_type = [k for k, v in schema.items() if "type" not in v]
     check("所有项都有 type", not missing_type, str(missing_type))
@@ -157,8 +159,6 @@ def main():
                    if "slider" in v and "default" in v
                    and not (v["slider"]["min"] <= v["default"] <= v["slider"]["max"])]
     check("默认值在范围内", not bad_default, str(bad_default))
-
-    # DEFAULTS 必须和 schema 对得上
     for k, v in schema.items():
         check(f"DEFAULTS 含 {k}", k in plugin_main.DEFAULTS, k)
         check(f"{k} 默认值一致",
@@ -166,209 +166,320 @@ def main():
               f"{plugin_main.DEFAULTS.get(k)} vs {v.get('default')}")
 
     # ------------------------------------------------------------------
-    print("\n[2] 股票数据")
-    codes = [s.code for s in stk.STOCKS]
+    print("\n[2] 货币对数据")
+    codes = [p.code for p in prs.PAIRS]
     check("代码唯一", len(codes) == len(set(codes)))
-    check("名字唯一", len({s.name for s in stk.STOCKS}) == len(stk.STOCKS))
-    check("基准价为正", all(s.base_price > 0 for s in stk.STOCKS))
-    check("波动率为正", all(s.daily_vol > 0 for s in stk.STOCKS))
-    check("能按代码查", stk.resolve("HD001") is not None)
-    check("能按小写代码查", stk.resolve("hd001") is not None)
-    check("能按名字查", stk.resolve("红豆银行") is not None)
-    check("能模糊查", stk.resolve("鲸鱼") is not None)
-    check("查不到返回 None", stk.resolve("不存在的票") is None)
-    check("空输入返回 None", stk.resolve("") is None)
+    check("基准价为正", all(p.base > 0 for p in prs.PAIRS))
+    check("波动率为正", all(p.daily_vol > 0 for p in prs.PAIRS))
+    check("小数位合法", all(0 <= p.digits <= 5 for p in prs.PAIRS))
+    check("按代码查", prs.resolve("USDJPY") is not None)
+    check("按小写查", prs.resolve("usdjpy") is not None)
+    check("按斜杠查", prs.resolve("USD/JPY") is not None)
+    check("按中文名查", prs.resolve("英镑/日元") is not None)
+    check("按中文模糊查", prs.resolve("黄金") is not None)
+    check("查不到返回 None", prs.resolve("不存在的对") is None)
+    check("空输入返回 None", prs.resolve("") is None)
+
+    p_jpy = prs.resolve("USDJPY")
+    check("日元对 3 位小数", p_jpy.digits == 3)
+    check("报价格式化", prs.fmt_price(p_jpy, 150.123456) == "150.123",
+          prs.fmt_price(p_jpy, 150.123456))
 
     # ------------------------------------------------------------------
     print("\n[3] 行情推进")
-    st = pkg.new_state(now=1000000.0)
-    check("初始有全部股票", len(st["stocks"]) == len(stk.STOCKS))
+    st = mkt.new_state(now=1000000.0)
+    check("初始有全部货币对", len(st["quotes"]) == len(prs.PAIRS))
     r = random.Random(42)
     for _ in range(200):
-        pkg.tick_state(st, 300, rng=r, now=1000000.0)
-    check("价格全部为正", all(v["price"] > 0 for v in st["stocks"].values()))
+        mkt.tick_state(st, 300, rng=r, now=1000000.0)
+    check("价格全部为正", all(v["price"] > 0 for v in st["quotes"].values()))
     check("tick 计数正确", st["tick_count"] == 200, str(st["tick_count"]))
-    # 软边界：跑很多 tick 后价格不应爆炸或归零
+
+    # 长期不应爆炸（外汇无漂移，应该回到基准附近）
     r2 = random.Random(7)
-    st2 = pkg.new_state(now=1000000.0)
+    st2 = mkt.new_state(now=1000000.0)
     for _ in range(2000):
-        pkg.tick_state(st2, 300, rng=r2, now=1000000.0)
-    ratios = [st2["stocks"][s.code]["price"] / s.base_price for s in stk.STOCKS]
-    check("长期不归零", min(ratios) > 0.05, f"min={min(ratios):.3f}")
-    check("长期不爆炸", max(ratios) < 20, f"max={max(ratios):.3f}")
+        mkt.tick_state(st2, 300, rng=r2, now=1000000.0)
+    ratios = [st2["quotes"][p.code]["price"] / p.base for p in prs.PAIRS]
+    check("长期不归零", min(ratios) > 0.3, f"min={min(ratios):.3f}")
+    check("长期不爆炸", max(ratios) < 3.0, f"max={max(ratios):.3f}")
 
-    # 历史长度有上限
-    hist = st2["stocks"]["HD001"]["history"]
-    check("历史长度有上限", len(hist) <= pkg.HISTORY_KEEP, str(len(hist)))
+    hist = st2["quotes"]["USDJPY"]["history"]
+    check("历史长度有上限", len(hist) <= mkt.HISTORY_KEEP, str(len(hist)))
 
-    # 补算
-    st3 = pkg.new_state(now=1000000.0)
-    n = pkg.catch_up(st3, 300, max_ticks=240, now=1000000.0 + 300 * 500)
+    st3 = mkt.new_state(now=1000000.0)
+    n = mkt.catch_up(st3, 300, max_ticks=240, now=1000000.0 + 300 * 500)
     check("补算有上限", n == 240, str(n))
 
     # ------------------------------------------------------------------
-    print("\n[4] 交易")
-    st = pkg.new_state(now=1000000.0)
-    u = pkg.user_of(st, "u1", "阿鲸", 1000.0, now=1000000.0)
-    check("开户送钱", u["cash"] == 1000.0)
-
-    px = pkg.price_of(st, "HD001")
-    ok, msg = pkg.buy(st, u, "HD001", 5)
-    check("买成功", ok, msg)
-    check("持仓增加", u["holdings"]["HD001"] == 5)
-    expect = 1000.0 - px * 5 - max(1.0, px * 5 * pkg.FEE_RATE)
-    check("现金扣对", abs(u["cash"] - expect) < 0.02, f"{u['cash']} vs {expect}")
-
-    ok, msg = pkg.buy(st, u, "HD001", 10 ** 6)
-    check("钱不够被拒", not ok, msg)
-
-    ok, msg = pkg.buy(st, u, "不存在", 1)
-    check("无此股票被拒", not ok, msg)
-
-    ok, msg = pkg.buy(st, u, "HD001", 0)
-    check("0 股被拒", not ok, msg)
-
-    ok, msg = pkg.sell(st, u, "HD001", 5)
-    check("卖成功", ok, msg)
-    check("持仓清空", "HD001" not in u["holdings"], str(u["holdings"]))
-
-    ok, msg = pkg.sell(st, u, "HD001", 1)
-    check("没持仓卖不出", not ok, msg)
-
-    ok, msg = pkg.sell(st, u, "HD002", 1)
-    check("卖没买的票被拒", not ok, msg)
-
-    # 部分卖出，成本按比例结转
-    st = pkg.new_state(now=1000000.0)
-    u = pkg.user_of(st, "u2", "小尾", 10000.0, now=1000000.0)
-    ok, m = pkg.buy(st, u, "HD001", 50)
-    check("部分卖出测试建仓成功", ok, m)
-    cost_all = u["cost"]["HD001"]
-    pkg.sell(st, u, "HD001", 20)
-    check("部分卖出后仍持仓", u["holdings"]["HD001"] == 30)
-    check("成本按比例结转",
-          abs(u["cost"]["HD001"] - cost_all * 0.6) < 1.0,
-          f"{u['cost']['HD001']} vs {cost_all * 0.6}")
+    print("\n[4] 点差")
+    st = mkt.new_state(now=1000000.0)
+    set_price(st, "USDJPY", 150.0)
+    bid, ask = mkt.bid_ask(st, "USDJPY")
+    check("买价低于卖价", bid < ask, f"{bid} / {ask}")
+    check("点差合理", 0 < (ask - bid) / 150 < 0.001, str((ask - bid) / 150))
 
     # ------------------------------------------------------------------
-    print("\n[5] 低保")
-    st = pkg.new_state(now=1000000.0)
-    u = pkg.user_of(st, "poor", "穷光蛋", 0.0, now=1000000.0)
-    ok, why = pkg.can_low_income(st, u, 300.0, now=1000000.0)
-    check("穷人能领", ok, why)
-    pkg.grant_low_income(st, u, 200.0, now=1000000.0)
-    check("低保到账", u["cash"] == 200.0, str(u["cash"]))
-    ok, why = pkg.can_low_income(st, u, 300.0, now=1000000.0)
-    check("当天不能重复领", not ok, why)
-    ok, why = pkg.can_low_income(st, u, 300.0, now=1000000.0 + 86400)
-    check("第二天能再领", ok, why)
+    print("\n[5] 开仓")
+    st = mkt.new_state(now=1000000.0)
+    set_price(st, "USDJPY", 150.0)
+    u = mkt.user_of(st, "u1", "久留美", 1000.0, now=1000000.0)
+    check("开户送钱", u["balance"] == 1000.0)
 
-    rich = pkg.user_of(st, "rich", "有钱人", 100000.0, now=1000000.0)
-    ok, why = pkg.can_low_income(st, rich, 300.0, now=1000000.0)
+    ok, msg = mkt.open_position(st, u, "USDJPY", "long", 0.5, 100)
+    check("开多成功", ok, msg)
+    check("有 1 个仓位", len(u["positions"]) == 1)
+    pos = u["positions"][0]
+    check("保证金正确", abs(pos["margin"] - 500 / 100) < 0.01, str(pos["margin"]))
+    check("名义价值正确", pos["notional"] == 500, str(pos["notional"]))
+    check("开仓扣了手续费", u["balance"] < 1000, str(u["balance"]))
+
+    # 杠杆不足被拒
+    u2 = mkt.user_of(st, "u2", "穷鬼", 5.0, now=1000000.0)
+    ok, msg = mkt.open_position(st, u2, "USDJPY", "long", 1.0, 100)
+    check("保证金不够被拒", not ok, msg)
+
+    # 参数校验
+    ok, _ = mkt.open_position(st, u, "USDJPY", "long", 0.001, 100)
+    check("手数太小被拒", not ok)
+    ok, _ = mkt.open_position(st, u, "USDJPY", "long", 0.5, 0)
+    check("杠杆 0 被拒", not ok)
+    ok, _ = mkt.open_position(st, u, "USDJPY", "long", 0.5, 1000)
+    check("杠杆过大被拒", not ok)
+    ok, _ = mkt.open_position(st, u, "NOPE", "long", 0.5, 100)
+    check("无此货币对被拒", not ok)
+
+    # 做空
+    st = mkt.new_state(now=1000000.0)
+    set_price(st, "USDJPY", 150.0)
+    us = mkt.user_of(st, "u3", "空军", 1000.0, now=1000000.0)
+    ok, msg = mkt.open_position(st, us, "USDJPY", "short", 0.5, 100)
+    check("开空成功", ok, msg)
+    check("空单方向正确", us["positions"][0]["side"] == "short")
+
+    # ------------------------------------------------------------------
+    print("\n[6] 盈亏计算")
+    st = mkt.new_state(now=1000000.0)
+    set_price(st, "USDJPY", 150.0)
+    u = mkt.user_of(st, "p", "测盈亏", 10000.0, now=1000000.0)
+    mkt.open_position(st, u, "USDJPY", "long", 1.0, 100)   # 名义 1000
+    entry = u["positions"][0]["entry"]
+
+    # 价格涨 1% → 盈利 10 红豆币
+    set_price(st, "USDJPY", entry * 1.01)
+    pnl = mkt.position_pnl(st, u["positions"][0])
+    check("多单涨 1% 盈利约 10", abs(pnl - 10) < 0.2, str(pnl))
+
+    # 价格跌 1% → 亏损 10
+    set_price(st, "USDJPY", entry * 0.99)
+    pnl = mkt.position_pnl(st, u["positions"][0])
+    check("多单跌 1% 亏损约 10", abs(pnl + 10) < 0.2, str(pnl))
+
+    # 空单方向相反
+    st2 = mkt.new_state(now=1000000.0)
+    set_price(st2, "USDJPY", 150.0)
+    us = mkt.user_of(st2, "s", "空单", 10000.0, now=1000000.0)
+    mkt.open_position(st2, us, "USDJPY", "short", 1.0, 100)
+    e2 = us["positions"][0]["entry"]
+    set_price(st2, "USDJPY", e2 * 0.99)
+    pnl2 = mkt.position_pnl(st2, us["positions"][0])
+    check("空单跌 1% 盈利约 10", abs(pnl2 - 10) < 0.2, str(pnl2))
+
+    # ------------------------------------------------------------------
+    print("\n[7] 爆仓")
+    st = mkt.new_state(now=1000000.0)
+    set_price(st, "USDJPY", 150.0)
+    u = mkt.user_of(st, "liq", "赌狗", 100.0, now=1000000.0)
+    # 100 红豆币，100 倍杠杆，开 5 手 = 5000 名义，保证金 50
+    ok, msg = mkt.open_position(st, u, "USDJPY", "long", 5.0, 100)
+    check("重仓开成功", ok, msg)
+    entry = u["positions"][0]["entry"]
+
+    check("一开始没爆", mkt.check_liquidation(st, u) == [])
+
+    # 价格反向走 1% → 亏 50，权益跌到保证金的一半 → 爆仓
+    set_price(st, "USDJPY", entry * 0.985)
+    liq = mkt.check_liquidation(st, u)
+    check("爆仓被触发", len(liq) > 0, str(liq))
+    check("爆仓后没仓位", u["positions"] == [])
+    check("爆仓后余额清零", u["balance"] == 0.0, str(u["balance"]))
+    check("爆仓计数 +1", u["liquidations"] == 1)
+
+    # 空仓不会爆
+    u_none = mkt.user_of(st, "none", "空仓", 100.0, now=1000000.0)
+    check("空仓不爆", mkt.check_liquidation(st, u_none) == [])
+
+    # ------------------------------------------------------------------
+    print("\n[8] 平仓")
+    st = mkt.new_state(now=1000000.0)
+    set_price(st, "USDJPY", 150.0)
+    u = mkt.user_of(st, "c", "平仓", 1000.0, now=1000000.0)
+    mkt.open_position(st, u, "USDJPY", "long", 1.0, 100)
+    entry = u["positions"][0]["entry"]
+    set_price(st, "USDJPY", entry * 1.01)   # 赚 10
+
+    bal_before = u["balance"]
+    ok, msg = mkt.close_position(st, u, 0)
+    check("平仓成功", ok, msg)
+    check("平仓后无仓位", u["positions"] == [])
+    check("平仓后余额增加", u["balance"] > bal_before, f"{bal_before} -> {u['balance']}")
+
+    ok, _ = mkt.close_position(st, u, 0)
+    check("平不存在的仓被拒", not ok)
+
+    # 多个仓位，倒序平
+    st = mkt.new_state(now=1000000.0)
+    u = mkt.user_of(st, "m", "多仓", 10000.0, now=1000000.0)
+    for _ in range(3):
+        mkt.open_position(st, u, "USDJPY", "long", 0.5, 100)
+    check("开了 3 个仓", len(u["positions"]) == 3)
+    for i in range(2, -1, -1):
+        mkt.close_position(st, u, i)
+    check("全部平掉", u["positions"] == [])
+
+    # ------------------------------------------------------------------
+    print("\n[9] 隔夜利息")
+    st = mkt.new_state(now=1000000.0)
+    set_price(st, "USDJPY", 150.0)
+    u = mkt.user_of(st, "sw", "持仓", 10000.0, now=1000000.0)
+    mkt.open_position(st, u, "USDJPY", "long", 1.0, 100)   # 名义 1000
+    bal0 = u["balance"]
+    paid = mkt.pay_swap(st, 0.001, now=1000000.0)          # 0.1%
+    check("利息有记录", len(paid) == 1, str(paid))
+    check("多头付利息", u["balance"] < bal0, f"{bal0} -> {u['balance']}")
+    check("利息金额对", abs(paid[0][1] + 1.0) < 0.05, str(paid))
+
+    st = mkt.new_state(now=1000000.0)
+    u2 = mkt.user_of(st, "sw2", "空头", 10000.0, now=1000000.0)
+    mkt.open_position(st, u2, "USDJPY", "short", 1.0, 100)
+    bal0 = u2["balance"]
+    mkt.pay_swap(st, 0.001, now=1000000.0)
+    check("空头收利息", u2["balance"] > bal0, f"{bal0} -> {u2['balance']}")
+
+    # 空仓不参与
+    st = mkt.new_state(now=1000000.0)
+    mkt.user_of(st, "nosw", "空仓", 1000.0, now=1000000.0)
+    check("空仓不收利息", mkt.pay_swap(st, 0.001) == [])
+
+    # ------------------------------------------------------------------
+    print("\n[10] 保证金比例与低保")
+    st = mkt.new_state(now=1000000.0)
+    set_price(st, "USDJPY", 150.0)
+    u = mkt.user_of(st, "ml", "比例", 1000.0, now=1000000.0)
+    check("空仓时比例为 None", mkt.margin_level(st, u) is None)
+    mkt.open_position(st, u, "USDJPY", "long", 1.0, 100)
+    lvl = mkt.margin_level(st, u)
+    check("有仓后有比例", lvl is not None and lvl > 0, str(lvl))
+
+    # 低保
+    st = mkt.new_state(now=1000000.0)
+    poor = mkt.user_of(st, "poor", "爆仓仔", 0.0, now=1000000.0)
+    ok, why = mkt.can_low_income(st, poor, 300.0, now=1000000.0)
+    check("穷人能领", ok, why)
+    mkt.grant_low_income(st, poor, 300.0, now=1000000.0)
+    check("低保到账", poor["balance"] == 300.0, str(poor["balance"]))
+    ok, _ = mkt.can_low_income(st, poor, 300.0, now=1000000.0)
+    check("当天不能重复领", not ok)
+    ok, _ = mkt.can_low_income(st, poor, 300.0, now=1000000.0 + 86400)
+    check("第二天能再领", ok)
+
+    rich = mkt.user_of(st, "rich", "有钱人", 100000.0, now=1000000.0)
+    ok, why = mkt.can_low_income(st, rich, 300.0, now=1000000.0)
     check("富人领不到", not ok, why)
 
-    # 资产上限按「现金+持仓」算，不是只看现金
-    mid = pkg.user_of(st, "mid", "中产", 0.0, now=1000000.0)
-    pkg.buy(st, mid, "HD001", 5)   # 现金不够，先给钱
-    mid["cash"] = 100.0
-    mid["holdings"] = {"HD003": 10}   # 10*260 = 2600 市值
-    ok, why = pkg.can_low_income(st, mid, 300.0, now=1000000.0)
-    check("持仓算进资产", not ok, why)
+    # 有仓位时按权益判定
+    mid = mkt.user_of(st, "mid", "有仓", 3000.0, now=1000000.0)
+    mkt.open_position(st, mid, "USDJPY", "long", 1.0, 100)
+    ok, why = mkt.can_low_income(st, mid, 300.0, now=1000000.0)
+    check("有仓按权益判", not ok, why)
 
     # ------------------------------------------------------------------
-    print("\n[6] 分红")
-    st = pkg.new_state(now=1000000.0)
-    u = pkg.user_of(st, "h", "持股人", 0.0, now=1000000.0)
-    u["holdings"] = {"HD001": 100}     # 100 * 100 = 10000 市值
-    paid = pkg.pay_dividends(st, 0.01, now=1000000.0)
-    check("分红有记录", len(paid) == 1, str(paid))
-    check("分红金额对", abs(paid[0][1] - 100.0) < 0.5, str(paid))
-    check("现金增加", abs(u["cash"] - 100.0) < 0.5, str(u["cash"]))
+    print("\n[11] 排行")
+    st = mkt.new_state(now=1000000.0)
+    mkt.user_of(st, "a", "甲", 100.0, now=1000000.0)
+    mkt.user_of(st, "b", "乙", 900.0, now=1000000.0)
+    rows = mkt.ranking(st, 10)
+    check("排行按权益降序", rows[0][0] == "b", str(rows))
 
-    empty = pkg.user_of(st, "e", "空仓", 0.0, now=1000000.0)
-    paid2 = pkg.pay_dividends(st, 0.01, now=1000000.0)
-    check("空仓不分红", all(uid != "e" for uid, _ in paid2))
+    check("sparkline 非空", len(mkt.sparkline(st, "USDJPY", 10)) > 0)
+    check("sparkline 无数据不崩", len(mkt.sparkline({"quotes": {}}, "X", 10)) == 10)
 
     # ------------------------------------------------------------------
-    print("\n[7] 排行与辅助")
-    st = pkg.new_state(now=1000000.0)
-    a = pkg.user_of(st, "a", "甲", 100.0, now=1000000.0)
-    b = pkg.user_of(st, "b", "乙", 900.0, now=1000000.0)
-    rows = pkg.ranking(st, 10)
-    check("排行按资产降序", rows[0][0] == "b", str(rows))
-
-    check("sparkline 非空", len(pkg.sparkline(st, "HD001", 10)) > 0)
-    check("sparkline 无历史不崩", len(pkg.sparkline({"stocks": {}}, "X", 10)) == 10)
-
-    # ------------------------------------------------------------------
-    print("\n[8] 插件层")
+    print("\n[12] 插件层")
     cfg = FakeConfig({
         "tick_minutes": 5,
         "initial_cash": 1000,
-        "low_income_amount": 200,
+        "default_leverage": 100,
+        "max_leverage": 500,
+        "low_income_amount": 300,
         "low_income_threshold": 300,
-        "dividend_hours": 6,
-        "dividend_rate": 0.8,
-        "price_decimals": 2,
+        "swap_rate_daily": 0.02,
     })
     p = P(context=None, config=cfg)
-
-    async def boot():
-        await p.initialize()
-    run(boot())
+    run(p.initialize())
     check("初始化后有状态", p._state is not None)
     check("存档文件已建", p._state_path.exists(), str(p._state_path))
     check("后台循环在跑", p._task is not None and not p._task.done())
 
     ev = FakeEvent()
     txt = call(p, ev)
-    check("行情页有内容", "红豆股市" in txt, txt[:80])
-    check("行情页含股票名", "红豆银行" in txt)
+    check("行情页有内容", "FX战士久留美" in txt, txt[:80])
+    check("行情页含货币对", "美元/日元" in txt)
 
-    txt = call(p, ev, "买", "HD001", "5")
-    check("买提示成功", "买入" in txt, txt[:80])
+    txt = call(p, ev, "多", "USDJPY", "0.5", "100")
+    check("做多提示成功", "做多" in txt, txt[:100])
 
     txt = call(p, ev, "仓")
-    check("持仓页显示股票", "红豆银行" in txt, txt[:120])
+    check("仓位页显示", "USDJPY" in txt, txt[:120])
+
+    txt = call(p, ev, "看", "XAUUSD")
+    check("详情页有黄金", "黄金" in txt, txt[:80])
+
+    txt = call(p, ev, "空", "EURUSD", "0.2")
+    check("省略杠杆用默认", "做空" in txt, txt[:100])
+
+    txt = call(p, ev, "多", "USDJPY", "0.5", "9999")
+    check("超杠杆被拒", "最高" in txt, txt[:80])
+
+    txt = call(p, ev, "全平")
+    check("一键平仓", "平掉" in txt, txt[:80])
 
     txt = call(p, ev, "榜")
-    check("排行榜有内容", "富豪榜" in txt, txt[:80])
-
-    txt = call(p, ev, "看", "HD003")
-    check("详情页有板块", "科技" in txt, txt[:80])
-
-    txt = call(p, ev, "卖", "HD001", "all")
-    check("全卖成功", "卖出" in txt, txt[:80])
+    check("排行榜有内容", "久留美富豪榜" in txt, txt[:80])
 
     txt = call(p, ev, "不存在的子命令")
     check("未知子命令有提示", "不认识" in txt, txt[:80])
 
-    txt = call(p, ev, "买")
+    txt = call(p, ev, "多")
     check("缺参数有用法", "用法" in txt, txt[:80])
 
     # 越界配置
     bad = P(context=None, config=FakeConfig({
         "tick_minutes": 9999,
         "initial_cash": -5,
-        "low_income_amount": -1,
-        "dividend_rate": 99,
+        "max_leverage": 99999,
+        "swap_rate_daily": 50,
     }))
     check("tick 钳到上限", bad._tick_seconds() == 120 * 60, str(bad._tick_seconds()))
     check("初始资金不为负", bad._initial_cash() >= 0)
-    check("低保不为负", bad._low_income_amount() >= 0)
-    check("分红率钳到 20%", abs(bad._dividend_rate() - 0.2) < 1e-9)
+    check("杠杆上限钳到 500", bad._max_leverage() == 500)
+    check("利率钳到 1%", abs(bad._swap_rate() - 0.01) < 1e-9, str(bad._swap_rate()))
 
     # 存档往返
-    async def roundtrip():
-        await p.terminate()
-    run(roundtrip())
+    run(p.terminate())
     p2 = P(context=None, config=cfg)
-
-    async def boot2():
-        await p2.initialize()
-    run(boot2())
+    run(p2.initialize())
     check("重启后账户还在", "1001" in (p2._state.get("users") or {}))
-    run(roundtrip())
+    run(p2.terminate())
+
+    # 旧版（股票）存档应被识别并重置
+    old_path = tmp / "fx.json"
+    old_path.write_text(json.dumps({"version": 1, "stocks": {"HD001": {}}}),
+                        encoding="utf-8")
+    p3 = P(context=None, config=cfg)
+    run(p3.initialize())
+    check("旧存档被重置", "quotes" in (p3._state or {}))
+    run(p3.terminate())
 
     # ------------------------------------------------------------------
     print(f"\n{'=' * 46}")
