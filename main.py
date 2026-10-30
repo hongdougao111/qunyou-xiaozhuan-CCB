@@ -1,24 +1,19 @@
-"""FX战士久留美 · 外汇保证金交易模拟插件 for AstrBot。
+"""红豆币爆仓模拟器 · 外汇保证金交易模拟插件 for AstrBot。
 
 钱币还是「红豆币」，玩法换成了外汇保证金交易。
 
-═══ 关于名字（借鉴说明）═══
+═══ 灵感来源（借鉴说明）═══
 
-本插件在名字与题材上借鉴了日本漫画《FX戦士くるみちゃん》
-（中译《FX战士久留美》）：
-借鉴的是标题命名方式，以及「拿小钱梭哈外汇、杠杆拉满、反复爆仓」
-这个核心情绪。
+本插件借鉴了日本漫画《FX戦士くるみちゃん》（中译《FX战士久留美》）的题材：
+「拿小钱梭哈外汇、杠杆拉满、反复爆仓」这种荒诞感。
 
-未使用原作任何角色形象、美术、对白或其他素材，代码与数值模型全部原创，
-插件内也没有出现「久留美」这一角色。本项目为非官方、非商业的同人性质
-作品，与原作作者及出版方无关联，未获授权或背书。
+借鉴的只是题材与情绪，未使用原作任何角色形象、美术、对白或其他素材，
+代码与数值模型全部原创，插件内也没有出现原作角色。
+本项目为独立、非商业作品，与原作作者及出版方无关联，未获授权或背书。
 
 ═══ 这个插件想表达什么 ═══
 
-「FX战士久留美」这个名字来自那个著名的梗：一个把外汇当赌场、
-杠杆开到最大、然后一路爆仓的战士。
-
-所以这个插件的核心不是「怎么赚钱」，而是**仓位管理**：
+核心不是「怎么赚钱」，而是**仓位管理**：
 
   - 默认 1 手 = 1000 红豆币名义价值
   - 杠杆可以开到 500 倍（1000 倍是真实世界的自杀选项，这里不给）
@@ -71,7 +66,7 @@ MAX_TICK_MINUTES = 120
 @register(
     "astrbot_plugin_hongdou_stock",
     "hongdougao111",
-    "FX战士久留美：红豆币外汇保证金交易，会爆仓，也有低保",
+    "红豆币爆仓模拟器：红豆币外汇保证金交易，会爆仓，也有低保",
     "2.0.0",
 )
 class FxKurumiPlugin(Star):
@@ -267,7 +262,7 @@ class FxKurumiPlugin(Star):
     @filter.command("fx")
     async def fx(self, event: AstrMessageEvent, sub: str = "", arg1: str = "",
                  arg2: str = "", arg3: str = ""):
-        """FX战士久留美。用法：/fx 多|空|平|全平|仓|榜|低保|看"""
+        """红豆币爆仓模拟器。用法：/fx 多|空|平|全平|仓|榜|低保|看"""
         async with self._lock:
             if self._state is None:
                 self._state = market.new_state()
@@ -313,7 +308,7 @@ class FxKurumiPlugin(Star):
     # ---------------- 渲染 ----------------
 
     def _render_market(self, st: dict[str, Any], u: dict[str, Any]) -> str:
-        lines = ["🍁 FX战士久留美 · 实时报价", ""]
+        lines = ["🍁 红豆币爆仓模拟器 · 实时报价", ""]
         for p in PAIRS:
             px = market.price_of(st, p.code)
             chg = market.change_pct(st, p.code)
@@ -391,7 +386,7 @@ class FxKurumiPlugin(Star):
         rows = market.ranking(st, 10)
         if not rows:
             return "还没有人入市。"
-        lines = ["🍁 久留美富豪榜", ""]
+        lines = ["🍁 红豆币富豪榜", ""]
         for i, (uid, nm, assets) in enumerate(rows, 1):
             medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
             me = " ←你" if uid == my_uid else ""
@@ -484,14 +479,14 @@ class FxKurumiPlugin(Star):
 
     @filter.command("fx诊断")
     async def diagnose(self, event: AstrMessageEvent):
-        """检查 FX战士久留美 运行状态。"""
+        """检查红豆币爆仓模拟器运行状态。"""
         st = self._state or {}
         users = len(st.get("users") or {})
         ticks = int(st.get("tick_count", 0))
         last = float(st.get("last_tick", 0.0))
         ago = int(time.time() - last) if last else -1
         yield event.plain_result(
-            "【FX战士久留美 诊断】\n"
+            "【红豆币爆仓模拟器 诊断】\n"
             f"存档：{self._diag.get('state_path', '(未初始化)')}\n"
             f"账户 {users} 个　行情周期 {ticks} 次\n"
             f"上次行情：{ago} 秒前　间隔 {self._tick_seconds()} 秒\n"
