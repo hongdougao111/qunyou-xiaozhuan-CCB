@@ -1,4 +1,4 @@
-"""FX战士久留美 · 离线自测。
+"""红豆币爆仓模拟器 · 离线自测。
 
 用伪造的 astrbot 模块跑一遍，不需要安装 AstrBot。
 
@@ -94,7 +94,7 @@ def install_fake_astrbot(data_dir: Path):
 
 
 class FakeEvent:
-    def __init__(self, uid="1001", name="久留美"):
+    def __init__(self, uid="1001", name="测试用户"):
         self._uid = uid
         self._name = name
 
@@ -223,7 +223,7 @@ def main():
     print("\n[5] 开仓")
     st = mkt.new_state(now=1000000.0)
     set_price(st, "USDJPY", 150.0)
-    u = mkt.user_of(st, "u1", "久留美", 1000.0, now=1000000.0)
+    u = mkt.user_of(st, "u1", "测试用户", 1000.0, now=1000000.0)
     check("开户送钱", u["balance"] == 1000.0)
 
     ok, msg = mkt.open_position(st, u, "USDJPY", "long", 0.5, 100)
@@ -423,7 +423,7 @@ def main():
 
     ev = FakeEvent()
     txt = call(p, ev)
-    check("行情页有内容", "FX战士久留美" in txt, txt[:80])
+    check("行情页有内容", "红豆币爆仓模拟器" in txt, txt[:80])
     check("行情页含货币对", "美元/日元" in txt)
 
     txt = call(p, ev, "多", "USDJPY", "0.5", "100")
@@ -445,7 +445,7 @@ def main():
     check("一键平仓", "平掉" in txt, txt[:80])
 
     txt = call(p, ev, "榜")
-    check("排行榜有内容", "久留美富豪榜" in txt, txt[:80])
+    check("排行榜有内容", "红豆币富豪榜" in txt, txt[:80])
 
     txt = call(p, ev, "不存在的子命令")
     check("未知子命令有提示", "不认识" in txt, txt[:80])
