@@ -8,7 +8,7 @@
       "max": 120,
       "step": 1
     },
-    "hint": "每隔这么久价格动一次。5 分钟比较接近现实节奏；1 分钟适合想快速玩一局的群，但存档会写得更勤。"
+    "hint": "每隔这么久报价动一次。外汇波动比股票小，5 分钟一次比较合适；1 分钟适合想快速体验爆仓的群。"
   },
   "initial_cash": {
     "description": "开户送的红豆币",
@@ -19,21 +19,43 @@
       "max": 100000,
       "step": 100
     },
-    "hint": "第一次说话的人自动开户并拿到这笔钱。设成 0 就只能靠低保起家。"
+    "hint": "第一次说话的人自动开户并拿到这笔钱。1000 配 100 倍杠杆能开 100 手，够赌一把。"
+  },
+  "default_leverage": {
+    "description": "默认杠杆",
+    "type": "int",
+    "default": 100,
+    "slider": {
+      "min": 1,
+      "max": 500,
+      "step": 1
+    },
+    "hint": "玩家不写杠杆时用这个。100 倍意味着价格反向走 1% 就爆仓。"
+  },
+  "max_leverage": {
+    "description": "杠杆上限",
+    "type": "int",
+    "default": 500,
+    "slider": {
+      "min": 1,
+      "max": 500,
+      "step": 1
+    },
+    "hint": "玩家能开的最高杠杆。500 倍下价格反向走 0.2% 就爆仓，基本是纯赌。"
   },
   "low_income_amount": {
     "description": "低保金额（红豆币）",
     "type": "int",
-    "default": 200,
+    "default": 300,
     "slider": {
       "min": 0,
       "max": 5000,
       "step": 50
     },
-    "hint": "每人每天可领一次。设成 0 等于关闭低保。这是防止玩家破产后再也玩不下去的兜底。"
+    "hint": "每人每天可领一次。设成 0 等于关闭低保。这是爆仓之后还能玩下去的兜底。"
   },
   "low_income_threshold": {
-    "description": "领低保的资产上限",
+    "description": "领低保的权益上限",
     "type": "int",
     "default": 300,
     "slider": {
@@ -41,39 +63,17 @@
       "max": 100000,
       "step": 100
     },
-    "hint": "总资产（现金+持仓市值）低于这个数才能领。设小了只有真破产的人能领，设大了会变成白送钱。"
+    "hint": "权益（余额+浮动盈亏）低于这个数才能领。设太小只有真爆仓的人能领，设太大就变成白送钱。"
   },
-  "dividend_hours": {
-    "description": "分红间隔（小时）",
-    "type": "int",
-    "default": 6,
-    "slider": {
-      "min": 1,
-      "max": 720,
-      "step": 1
-    },
-    "hint": "持有股票每隔这么久能拿一次分红，鼓励长期持有而不是天天追涨杀跌。"
-  },
-  "dividend_rate": {
-    "description": "每次分红比例（%）",
+  "swap_rate_daily": {
+    "description": "隔夜利息（每日，%）",
     "type": "float",
-    "default": 0.8,
+    "default": 0.02,
     "slider": {
       "min": 0,
-      "max": 20,
-      "step": 0.1
+      "max": 1,
+      "step": 0.01
     },
-    "hint": "按持仓市值计算。0.8 表示每 1000 红豆币持仓发 8 个。别设太大，会通胀到没人想交易。"
-  },
-  "price_decimals": {
-    "description": "价格保留小数位",
-    "type": "int",
-    "default": 2,
-    "slider": {
-      "min": 0,
-      "max": 4,
-      "step": 1
-    },
-    "hint": "只影响展示。内部始终用浮点算，改这个不会影响盈亏。"
+    "hint": "持仓过夜按名义价值收/付。多头付、空头收。这是防止玩家「开了不管」的机制，设 0 就关掉。"
   }
 }
