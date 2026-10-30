@@ -8,6 +8,7 @@
   <img alt="version" src="https://img.shields.io/badge/version-2.0.0-00a870">
   <img alt="python" src="https://img.shields.io/badge/python-3.10+-3776ab">
   <img alt="network" src="https://img.shields.io/badge/network-none-8b8b8f">
+  <a href="https://github.com/hongdougao111/qunyou-xiaozhuan-CCB/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/hongdougao111/qunyou-xiaozhuan-CCB"></a>
 </p>
 
 <p align="center">
@@ -172,6 +173,17 @@ Bot： 🍁 我的仓位
 ---
 
 ## 🚀 安装
+
+### 方式一：下载 Release 压缩包（推荐）
+
+去 [Releases](https://github.com/hongdougao111/qunyou-xiaozhuan-CCB/releases/latest) 下载
+`astrbot_plugin_hongdou_stock.zip`，然后：
+
+1. AstrBot WebUI → 插件 → 安装插件 → 上传该 zip
+2. 找到「红豆币爆仓模拟器」→ 重载
+3. 群里发 `/fx`
+
+### 方式二：手动放目录
 
 1. 把 `astrbot_plugin_hongdou_stock` 目录放进 `AstrBot/data/plugins/`
 2. WebUI → 插件 → 红豆币爆仓模拟器 → 重载
