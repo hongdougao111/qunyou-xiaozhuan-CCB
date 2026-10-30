@@ -1,16 +1,35 @@
-"""红豆股市 · 市场引擎。
+"""FX战士久留美 · 交易引擎。
 
 纯逻辑、纯同步、不碰 AstrBot，方便单测。插件层负责加锁和落盘。
 
-核心概念：
-  tick      一次行情刷新。默认 5 分钟一次，一天 288 次。
-  价格模型  几何随机游走 + 每日漂移 + 软边界反弹。
-            每 tick 波动 = 日波动率 / sqrt(一天多少 tick)，
-            所以「日波动率」这个参数是直觉可读的。
-  软边界    价格跌破 base*0.2 时漂移转正、涨过 base*5 时漂移转负，
-            既不会跌成 0 卡死，也不会无限膨胀。
+═══ 和股票最大的区别 ═══
 
-所有金额单位都是「红豆币」，内部用 float，展示时取整。
+股票是「有多少钱买多少货」，外汇是**保证金交易**：
+
+    你只需要交一小部分保证金，就能开一个比本金大得多的仓位。
+
+默认 1 手 = 1000 红豆币名义价值，100 倍杠杆 → 开 1 手只要 10 红豆币保证金。
+听起来很爽，但反过来：**价格反向走 1%，你的保证金就没了**。
+
+所以这个游戏的核心不是「涨跌」，是**仓位管理**。
+
+═══ 爆仓机制 ═══
+
+每 tick 检查一次：
+
+    权益 = 余额 + 所有持仓的浮动盈亏
+    占用保证金 = Σ 各仓位保证金
+
+    当 权益 < 占用保证金 × 强平线（默认 50%）→ 强制平仓，余额清零
+
+强平线 50% 意味着：亏损达到保证金的一半就会被强平。
+100 倍杠杆下，价格反向走 0.5% 就爆。
+
+═══ 隔夜利息（Swap）═══
+
+持仓过夜要付/收利息，按名义价值计算。
+正数收钱、负数付钱，模拟真实市场的掉期。
+这是防止玩家「开了不管」的机制。
 """
 from __future__ import annotations
 
@@ -19,43 +38,40 @@ import random
 import time
 from typing import Any
 
-from .stocks import STOCKS, Stock, resolve
+from .pairs import PAIRS, Pair, resolve
 
-# ---- 交易规则常量（改这里，不是配置项，避免玩家乱调）----
-FEE_RATE = 0.0015          # 手续费 0.15%
-FEE_MIN = 1.0              # 最低手续费 1 红豆币
-PRICE_FLOOR = 0.5          # 绝对价格下限
-SHARES_MIN = 1             # 最少买 1 股
-SHARES_MAX_ORDER = 1_000_000
+# ---- 合约与交易规则 ----
+CONTRACT_SIZE = 1000.0     # 1 手 = 1000 红豆币名义价值
+LOT_MIN = 0.01             # 最小 0.01 手
+LOT_MAX = 100.0            # 单笔最大 100 手
+SPREAD_RATIO = 0.00012     # 点差：单边 0.012%，来回 0.024%
+COMMISSION_RATE = 0.0002   # 手续费 0.02% 名义价值，开平各收一次
 
-# ---- 软边界 ----
-LOW_BAND = 0.20
-HIGH_BAND = 5.00
-BAND_PUSH = 0.006          # 触边后每 tick 额外施加的漂移
+# ---- 强平 ----
+MARGIN_CALL_RATIO = 0.50   # 权益低于保证金的 50% 就强平
 
 # ---- 历史 ----
-HISTORY_KEEP = 288         # 每只股票保留最近 288 个 tick（约一天）
+HISTORY_KEEP = 288
 
 
 def new_state(now: float | None = None) -> dict[str, Any]:
-    """全新市场状态。"""
+    """全新市场。"""
     t = now if now is not None else time.time()
-    stocks: dict[str, dict[str, Any]] = {}
-    for s in STOCKS:
-        stocks[s.code] = {
-            "price": s.base_price,
-            "open": s.base_price,
-            "prev_close": s.base_price,
-            "history": [s.base_price],
-            "volume": 0,
+    quotes: dict[str, dict[str, Any]] = {}
+    for p in PAIRS:
+        quotes[p.code] = {
+            "price": p.base,
+            "open": p.base,
+            "prev_close": p.base,
+            "history": [p.base],
         }
     return {
-        "version": 1,
+        "version": 2,
         "created_at": t,
         "last_tick": t,
         "tick_count": 0,
         "day": _day_key(t),
-        "stocks": stocks,
+        "quotes": quotes,
         "users": {},
         "news": [],
     }
@@ -79,63 +95,46 @@ def tick_state(
     rng: random.Random | None = None,
     now: float | None = None,
 ) -> list[str]:
-    """推进一个 tick，返回值得公告的新闻（涨跌幅超阈值的）。
-
-    不负责补算漏掉的 tick —— 那是 catch_up 的事。
-    """
+    """推进一个 tick，返回异动新闻。"""
     r = rng or random.Random()
     t = now if now is not None else time.time()
-    n = ticks_per_day(tick_seconds)
-    sq = math.sqrt(n)
+    sq = math.sqrt(ticks_per_day(tick_seconds))
 
     news: list[str] = []
     today = _day_key(t)
 
-    for s in STOCKS:
-        st = state["stocks"].setdefault(
-            s.code,
-            {"price": s.base_price, "open": s.base_price,
-             "prev_close": s.base_price, "history": [], "volume": 0},
+    for p in PAIRS:
+        q = state["quotes"].setdefault(
+            p.code,
+            {"price": p.base, "open": p.base, "prev_close": p.base,
+             "history": [p.base]},
         )
-        price = float(st.get("price", s.base_price))
-        base = s.base_price
-
-        # 软边界：把价格往区间内推
-        band_drift = 0.0
-        if price < base * LOW_BAND:
-            band_drift = BAND_PUSH
-        elif price > base * HIGH_BAND:
-            band_drift = -BAND_PUSH
-
-        mu = s.daily_drift / n + band_drift
-        sigma = s.daily_vol / sq
+        price = float(q.get("price", p.base))
+        sigma = p.daily_vol / sq
+        # 外汇没有长期漂移，纯随机游走
         shock = r.gauss(0.0, 1.0)
+        new_price = price * math.exp(sigma * shock)
 
-        new_price = price * math.exp(mu + sigma * shock)
-        if new_price < PRICE_FLOOR:
-            new_price = PRICE_FLOOR
-        # 单 tick 最大涨跌 12%，防止极端随机数把价格撕碎
-        new_price = max(price * 0.88, min(price * 1.12, new_price))
-
-        st["price"] = round(new_price, 2)
-        hist = st.setdefault("history", [])
-        hist.append(st["price"])
+        # 单 tick 最大 3%，外汇极少出现更大的单 tick 波动
+        new_price = max(price * 0.97, min(price * 1.03, new_price))
+        q["price"] = round(new_price, p.digits + 1)
+        hist = q.setdefault("history", [])
+        hist.append(q["price"])
         if len(hist) > HISTORY_KEEP:
             del hist[: len(hist) - HISTORY_KEEP]
 
-        chg = (st["price"] - price) / price if price > 0 else 0.0
-        if abs(chg) >= 0.08:
+        chg = (q["price"] - price) / price if price > 0 else 0.0
+        if abs(chg) >= 0.012:
             arrow = "📈" if chg > 0 else "📉"
             news.append(
-                f"{arrow} {s.name}({s.code}) 单次{'暴涨' if chg > 0 else '暴跌'} "
-                f"{abs(chg) * 100:.1f}%，现价 {st['price']:.2f}"
+                f"{arrow} {p.name} 剧烈波动 {chg * 100:+.2f}%，"
+                f"现价 {q['price']:.{p.digits}f}"
             )
 
-    # 跨日：结算开盘价与昨收
     if today != state.get("day"):
-        for code, st in state["stocks"].items():
-            st["prev_close"] = st.get("price", 0.0)
-            st["open"] = st.get("price", 0.0)
+        for code, q in state["quotes"].items():
+            q["prev_close"] = q.get("price", 0.0)
+            q["open"] = q.get("price", 0.0)
         state["day"] = today
 
     state["last_tick"] = t
@@ -154,11 +153,7 @@ def catch_up(
     max_ticks: int = 240,
     now: float | None = None,
 ) -> int:
-    """停机期间漏掉的 tick 补算，最多补 max_ticks 个。
-
-    为什么要设上限：服务器关了一周，补 2000 个 tick 会卡住启动，
-    而且价格早就随机漂到没意义的地方了。补一小段意思一下即可。
-    """
+    """补算停机期间漏掉的 tick，有上限。"""
     t = now if now is not None else time.time()
     last = float(state.get("last_tick", t))
     step = max(60, tick_seconds)
@@ -174,50 +169,55 @@ def catch_up(
 
 
 # ---------------------------------------------------------------------------
-# 查询
+# 报价
 # ---------------------------------------------------------------------------
 
 def price_of(state: dict[str, Any], code: str) -> float:
-    st = state.get("stocks", {}).get(code)
-    if not st:
+    q = state.get("quotes", {}).get(code)
+    if not q:
         return 0.0
-    return float(st.get("price", 0.0))
+    return float(q.get("price", 0.0))
+
+
+def bid_ask(state: dict[str, Any], code: str) -> tuple[float, float]:
+    """买卖价。做多按 ask 开、bid 平；做空反过来。"""
+    mid = price_of(state, code)
+    half = mid * SPREAD_RATIO / 2
+    return mid - half, mid + half
 
 
 def change_pct(state: dict[str, Any], code: str) -> float:
-    """当日涨跌幅（相对昨收）。"""
-    st = state.get("stocks", {}).get(code)
-    if not st:
+    q = state.get("quotes", {}).get(code)
+    if not q:
         return 0.0
-    prev = float(st.get("prev_close") or st.get("price") or 0.0)
-    cur = float(st.get("price") or 0.0)
+    prev = float(q.get("prev_close") or q.get("price") or 0.0)
+    cur = float(q.get("price") or 0.0)
     if prev <= 0:
         return 0.0
     return (cur - prev) / prev
 
 
 def sparkline(state: dict[str, Any], code: str, width: int = 12) -> str:
-    """把最近的价格画成一条迷你走势线。"""
-    st = state.get("stocks", {}).get(code)
-    if not st:
+    q = state.get("quotes", {}).get(code)
+    if not q:
         return "▁" * width
-    hist = list(st.get("history") or [])
+    hist = list(q.get("history") or [])
     if len(hist) < 2:
         return "▁" * width
     hist = hist[-width:]
     lo, hi = min(hist), max(hist)
     blocks = "▁▂▃▄▅▆▇█"
-    if hi - lo < 1e-9:
+    if hi - lo < 1e-12:
         return blocks[3] * len(hist)
     out = []
-    for p in hist:
-        idx = int((p - lo) / (hi - lo) * (len(blocks) - 1))
+    for v in hist:
+        idx = int((v - lo) / (hi - lo) * (len(blocks) - 1))
         out.append(blocks[max(0, min(len(blocks) - 1, idx))])
     return "".join(out)
 
 
 # ---------------------------------------------------------------------------
-# 用户与交易
+# 账户
 # ---------------------------------------------------------------------------
 
 def user_of(
@@ -227,20 +227,20 @@ def user_of(
     initial_cash: float = 0.0,
     now: float | None = None,
 ) -> dict[str, Any]:
-    """取用户，没有就开户（送 initial_cash）。"""
+    """取用户，没有就开户。"""
     users = state.setdefault("users", {})
     u = users.get(uid)
     if u is None:
         t = now if now is not None else time.time()
         u = {
             "name": name or uid,
-            "cash": float(initial_cash),
-            "holdings": {},
-            "cost": {},
+            "balance": float(initial_cash),
+            "positions": [],
             "created_at": t,
             "last_low_income": None,
-            "last_dividend": t,
+            "last_swap": t,
             "trades": 0,
+            "liquidations": 0,
             "realized": 0.0,
         }
         users[uid] = u
@@ -249,110 +249,220 @@ def user_of(
     return u
 
 
-def holding_value(state: dict[str, Any], u: dict[str, Any]) -> float:
-    total = 0.0
-    for code, sh in (u.get("holdings") or {}).items():
-        if sh > 0:
-            total += price_of(state, code) * sh
-    return total
+def position_pnl(state: dict[str, Any], pos: dict[str, Any]) -> float:
+    """单个仓位的浮动盈亏（红豆币）。"""
+    pair = resolve(pos.get("pair", ""))
+    if pair is None:
+        return 0.0
+    entry = float(pos.get("entry", 0.0))
+    cur = price_of(state, pair.code)
+    if entry <= 0 or cur <= 0:
+        return 0.0
+    notional = float(pos.get("notional", 0.0))
+    direction = 1 if pos.get("side") == "long" else -1
+    return notional * (cur - entry) / entry * direction
+
+
+def floating_pnl(state: dict[str, Any], u: dict[str, Any]) -> float:
+    return sum(position_pnl(state, p) for p in (u.get("positions") or []))
+
+
+def used_margin(state: dict[str, Any], u: dict[str, Any]) -> float:
+    return sum(float(p.get("margin", 0.0)) for p in (u.get("positions") or []))
+
+
+def equity(state: dict[str, Any], u: dict[str, Any]) -> float:
+    """权益 = 余额 + 浮动盈亏。"""
+    return float(u.get("balance", 0.0)) + floating_pnl(state, u)
+
+
+def free_margin(state: dict[str, Any], u: dict[str, Any]) -> float:
+    return equity(state, u) - used_margin(state, u)
+
+
+def margin_level(state: dict[str, Any], u: dict[str, Any]) -> float | None:
+    """保证金比例（%）。没有持仓返回 None。"""
+    used = used_margin(state, u)
+    if used <= 0:
+        return None
+    return equity(state, u) / used * 100.0
 
 
 def total_assets(state: dict[str, Any], u: dict[str, Any]) -> float:
-    return float(u.get("cash", 0.0)) + holding_value(state, u)
+    """总资产，用于排行和低保判定。"""
+    return equity(state, u)
 
 
-def _fee(amount: float) -> float:
-    return max(FEE_MIN, amount * FEE_RATE)
+# ---------------------------------------------------------------------------
+# 开仓 / 平仓
+# ---------------------------------------------------------------------------
 
-
-def buy(
+def open_position(
     state: dict[str, Any],
     u: dict[str, Any],
     code: str,
-    shares: int,
+    side: str,
+    lots: float,
+    leverage: int,
 ) -> tuple[bool, str]:
-    """买入。返回 (成功?, 说明文字)。"""
-    stock = resolve(code)
-    if stock is None:
-        return False, "没有这只股票。"
-    if shares < SHARES_MIN:
-        return False, f"最少买 {SHARES_MIN} 股。"
-    if shares > SHARES_MAX_ORDER:
-        return False, "单笔太大了，分批买吧。"
+    """开仓。side: long / short。"""
+    pair = resolve(code)
+    if pair is None:
+        return False, "没有这个货币对。"
+    if side not in ("long", "short"):
+        return False, "方向只能是 做多(long) 或 做空(short)。"
+    if lots < LOT_MIN:
+        return False, f"最小 {LOT_MIN} 手。"
+    if lots > LOT_MAX:
+        return False, f"单笔最大 {LOT_MAX} 手，别太贪。"
+    if leverage < 1 or leverage > 500:
+        return False, "杠杆要在 1-500 之间。"
 
-    px = price_of(state, stock.code)
-    if px <= 0:
-        return False, "这只票现在没报价。"
-    amount = px * shares
-    fee = _fee(amount)
-    need = amount + fee
-    cash = float(u.get("cash", 0.0))
-    if cash < need:
+    notional = lots * CONTRACT_SIZE
+    margin = notional / leverage
+    commission = notional * COMMISSION_RATE
+
+    bal = float(u.get("balance", 0.0))
+    need = margin + commission
+    free = free_margin(state, u)
+    if free < need:
         return False, (
-            f"红豆币不够。需要 {need:.0f}（含手续费 {fee:.0f}），"
-            f"你只有 {cash:.0f}。"
+            f"可用保证金不够。需要 {need:.2f}（保证金 {margin:.2f} + "
+            f"手续费 {commission:.2f}），你只有 {free:.2f}。"
         )
 
-    u["cash"] = round(cash - need, 2)
-    hold = u.setdefault("holdings", {})
-    hold[stock.code] = int(hold.get(stock.code, 0)) + shares
-    cost = u.setdefault("cost", {})
-    cost[stock.code] = round(float(cost.get(stock.code, 0.0)) + need, 2)
+    bid, ask = bid_ask(state, pair.code)
+    entry = ask if side == "long" else bid
+
+    u["balance"] = round(bal - commission, 4)
+    u.setdefault("positions", []).append({
+        "pair": pair.code,
+        "side": side,
+        "lots": lots,
+        "entry": entry,
+        "notional": notional,
+        "margin": margin,
+        "leverage": leverage,
+        "opened_at": time.time(),
+    })
     u["trades"] = int(u.get("trades", 0)) + 1
+
+    word = "做多" if side == "long" else "做空"
     return True, (
-        f"买入 {stock.name} {shares} 股 @ {px:.2f}，"
-        f"花费 {amount:.0f} + 手续费 {fee:.0f} = {need:.0f} 红豆币。"
+        f"{word} {pair.name} {lots:g} 手 @ {entry:.{pair.digits}f}\n"
+        f"名义 {notional:.0f}　{leverage}x　保证金 {margin:.2f}　"
+        f"手续费 {commission:.2f}\n"
+        f"价格反向走 {100 / leverage:.2f}% 就爆仓"
     )
 
 
-def sell(
+def close_position(
     state: dict[str, Any],
     u: dict[str, Any],
-    code: str,
-    shares: int,
+    index: int,
+    reason: str = "手动平仓",
 ) -> tuple[bool, str]:
-    """卖出。返回 (成功?, 说明文字)。"""
-    stock = resolve(code)
-    if stock is None:
-        return False, "没有这只股票。"
-    hold = u.setdefault("holdings", {})
-    owned = int(hold.get(stock.code, 0))
-    if owned <= 0:
-        return False, f"你没有 {stock.name} 的持仓。"
-    if shares < SHARES_MIN:
-        return False, f"最少卖 {SHARES_MIN} 股。"
-    if shares > owned:
-        return False, f"你只有 {owned} 股，卖不了 {shares} 股。"
+    """按索引平仓。"""
+    pos_list = u.get("positions") or []
+    if index < 0 or index >= len(pos_list):
+        return False, "没有这个仓位的编号。"
+    pos = pos_list[index]
+    pair = resolve(pos.get("pair", ""))
+    if pair is None:
+        pos_list.pop(index)
+        return False, "仓位数据异常，已清除。"
 
-    px = price_of(state, stock.code)
-    gross = px * shares
-    fee = _fee(gross)
-    net = gross - fee
+    pnl = position_pnl(state, pos)
+    notional = float(pos.get("notional", 0.0))
+    commission = notional * COMMISSION_RATE
+    margin = float(pos.get("margin", 0.0))
 
-    # 成本按股数比例结转，用来算已实现盈亏
-    cost = u.setdefault("cost", {})
-    total_cost = float(cost.get(stock.code, 0.0))
-    part_cost = total_cost * (shares / owned) if owned else 0.0
-    u["realized"] = round(
-        float(u.get("realized", 0.0)) + (net - part_cost), 2
-    )
-    cost[stock.code] = round(max(0.0, total_cost - part_cost), 2)
+    # 平仓时把保证金还回去，加上盈亏，扣掉手续费
+    net = margin + pnl - commission
+    # 亏损超过保证金的部分，从余额里扣（最多扣到余额为 0）
+    if net < 0:
+        net = max(-float(u.get("balance", 0.0)), net)
 
-    hold[stock.code] = owned - shares
-    if hold[stock.code] <= 0:
-        hold.pop(stock.code, None)
-        cost.pop(stock.code, None)
+    u["balance"] = round(float(u.get("balance", 0.0)) + net, 4)
+    u["realized"] = round(float(u.get("realized", 0.0)) + pnl - commission, 4)
+    pos_list.pop(index)
 
-    u["cash"] = round(float(u.get("cash", 0.0)) + net, 2)
-    u["trades"] = int(u.get("trades", 0)) + 1
-
-    pnl = net - part_cost
-    sign = "赚" if pnl >= 0 else "亏"
+    side = "多" if pos.get("side") == "long" else "空"
+    pnl_word = "赚" if pnl >= 0 else "亏"
     return True, (
-        f"卖出 {stock.name} {shares} 股 @ {px:.2f}，"
-        f"到手 {net:.0f}（手续费 {fee:.0f}），{sign}了 {abs(pnl):.0f} 红豆币。"
+        f"{reason}：平掉 {pair.name} {side} {pos.get('lots', 0):g} 手\n"
+        f"浮动盈亏 {pnl:+.2f}　手续费 {commission:.2f}　"
+        f"净结算 {net:+.2f}　{pnl_word}了 {abs(pnl):.2f}"
     )
 
+
+def check_liquidation(
+    state: dict[str, Any],
+    u: dict[str, Any],
+) -> list[str]:
+    """检查爆仓，触发则清空所有仓位。返回说明文字。"""
+    pos_list = u.get("positions") or []
+    if not pos_list:
+        return []
+    used = used_margin(state, u)
+    if used <= 0:
+        return []
+    eq = equity(state, u)
+    if eq >= used * MARGIN_CALL_RATIO:
+        return []
+
+    # 爆仓：所有仓位按当前价强平，余额清零
+    total_pnl = floating_pnl(state, u)
+    u["positions"] = []
+    u["balance"] = 0.0
+    u["liquidations"] = int(u.get("liquidations", 0)) + 1
+    u["realized"] = round(float(u.get("realized", 0.0)) + total_pnl, 4)
+
+    return [
+        f"💥 爆仓！权益 {eq:.2f} 低于保证金 {used:.2f} 的 "
+        f"{MARGIN_CALL_RATIO * 100:.0f}%，全部仓位被强制平仓，余额清零。"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 隔夜利息
+# ---------------------------------------------------------------------------
+
+def pay_swap(
+    state: dict[str, Any],
+    rate_per_day: float,
+    now: float | None = None,
+) -> list[tuple[str, float]]:
+    """对所有持仓收/付隔夜利息，返回 [(uid, 净额)]。
+
+    rate_per_day 是「每日名义价值的比例」。
+    做多付利息、做空收利息 —— 真实市场里美元多头通常付息，
+    这里统一成：多头付、空头收，简单好懂。
+    """
+    out: list[tuple[str, float]] = []
+    for uid, u in (state.get("users") or {}).items():
+        pos_list = u.get("positions") or []
+        if not pos_list:
+            continue
+        total = 0.0
+        for p in pos_list:
+            notional = float(p.get("notional", 0.0))
+            amt = notional * rate_per_day
+            if p.get("side") == "long":
+                total -= amt      # 多头付
+            else:
+                total += amt      # 空头收
+        if abs(total) < 0.01:
+            continue
+        u["balance"] = round(float(u.get("balance", 0.0)) + total, 4)
+        u["last_swap"] = now if now is not None else time.time()
+        out.append((uid, total))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 低保
+# ---------------------------------------------------------------------------
 
 def can_low_income(
     state: dict[str, Any],
@@ -360,7 +470,6 @@ def can_low_income(
     threshold: float,
     now: float | None = None,
 ) -> tuple[bool, str]:
-    """能不能领低保。"""
     t = now if now is not None else time.time()
     today = _day_key(t)
     if u.get("last_low_income") == today:
@@ -368,7 +477,7 @@ def can_low_income(
     assets = total_assets(state, u)
     if assets > threshold:
         return False, (
-            f"低保是给穷人的。你现在身家 {assets:.0f}，"
+            f"低保是给爆仓的人的。你现在权益 {assets:.0f}，"
             f"超过 {threshold:.0f} 就领不了了。"
         )
     return True, ""
@@ -381,37 +490,16 @@ def grant_low_income(
     now: float | None = None,
 ) -> str:
     t = now if now is not None else time.time()
-    u["cash"] = round(float(u.get("cash", 0.0)) + amount, 2)
+    u["balance"] = round(float(u.get("balance", 0.0)) + amount, 4)
     u["last_low_income"] = _day_key(t)
-    return f"低保到账 {amount:.0f} 红豆币，好好活着，别乱赌。"
+    return f"低保到账 {amount:.0f} 红豆币。别急着开 100 倍，先想清楚。"
 
 
-def pay_dividends(
-    state: dict[str, Any],
-    rate: float,
-    now: float | None = None,
-) -> list[tuple[str, float]]:
-    """给所有持仓用户分红，返回 [(uid, 金额)]。
-
-    rate 是「每 tick 分红率」，插件层按分红周期换算后传入。
-    """
-    t = now if now is not None else time.time()
-    out: list[tuple[str, float]] = []
-    for uid, u in (state.get("users") or {}).items():
-        hv = holding_value(state, u)
-        if hv <= 0:
-            continue
-        amt = round(hv * rate, 2)
-        if amt < 1:
-            continue
-        u["cash"] = round(float(u.get("cash", 0.0)) + amt, 2)
-        u["last_dividend"] = t
-        out.append((uid, amt))
-    return out
-
+# ---------------------------------------------------------------------------
+# 排行
+# ---------------------------------------------------------------------------
 
 def ranking(state: dict[str, Any], limit: int = 10) -> list[tuple[str, str, float]]:
-    """按总资产排行，返回 [(uid, 名字, 总资产)]。"""
     rows = []
     for uid, u in (state.get("users") or {}).items():
         rows.append((uid, str(u.get("name", uid)), total_assets(state, u)))
